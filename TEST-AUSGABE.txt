@@ -1,0 +1,27 @@
+test_konkurrierende_vergabe_4_slots_5ter_abgewiesen (test_slots.TestAcquire) ... ok
+test_owner_schutz (test_slots.TestAcquire) ... ok
+test_slot_wunsch_belegt_abgewiesen (test_slots.TestAcquire) ... ok
+test_db_adapter_hart_nicht_verfuegbar (test_slots.TestAdapters) ... ok
+test_idle_nur_diagnose_keine_aktion (test_slots.TestIdleDiagnose) ... ok
+test_abgelaufener_lease_reacquirierbar_ohne_loeschen (test_slots.TestLease) ... ok
+test_aktiver_lease_verhindert_fremd_acquire (test_slots.TestLease) ... ok
+test_healthcheck_timeout_cleanup_nur_eigener_prozess (test_slots.TestProcess) ... /Volumes/External Disk/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/subprocess.py:1052: ResourceWarning: subprocess 82693 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_restart_bounded (test_slots.TestProcess) ... /Volumes/External Disk/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/subprocess.py:1052: ResourceWarning: subprocess 82774 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/Volumes/External Disk/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/subprocess.py:1052: ResourceWarning: subprocess 82780 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_start_healthcheck_stop (test_slots.TestProcess) ... /Volumes/External Disk/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/subprocess.py:1052: ResourceWarning: subprocess 82791 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 6.936s
+
+OK
