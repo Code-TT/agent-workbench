@@ -8,7 +8,7 @@ festgelegten Infrastruktur-Repository-Scope übernommen werden.
 ## CLI
 
 ```bash
-python3 -m testslot_manager acquire --owner <name> [--slot 1..4]   # -> JSON mit token
+python3 -m testslot_manager acquire --owner <name> [--slot 1..4] [--steal]   # -> JSON mit token
 python3 -m testslot_manager status
 python3 -m testslot_manager heartbeat --slot N --token T           # Lease verlängern
 python3 -m testslot_manager start --slot N --token T [--port P] [--health-timeout 30] \
@@ -28,15 +28,23 @@ python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Cre
 - **Ownership-Token (uuid4):** `heartbeat/release/start/restart/stop` verlangen ihn;
   fremde Tokens werden abgelehnt.
 - **Lease:** Default 900 s, via `heartbeat` verlängerbar. Abgelaufene Leases sind
-  re-acquirierbar; **es wird dabei nichts gelöscht** — Logs/Artefakte bleiben, ein noch
-  laufender Prozess wird nicht getötet, sondern als `orphan` vermerkt.
+  re-acquirierbar; **es wird dabei nichts gelöscht** — Logs/Artefakte bleiben.
+  Läuft trotz abgelaufenem Lease noch ein vom Manager gestarteter Prozess, wird der
+  Slot **nicht** neu vergeben (kein Doppelstart, Prozesszuordnung bleibt erhalten):
+  der alte Owner kann mit seinem Token `stop`/`release`. Übernahme nur mit
+  `acquire --steal`, das genau diesen eigenen (verwaisten) Prozess kontrolliert beendet.
 - **Ports:** feste Bereiche — Slot 1: 31200–31219, Slot 2: 31220–31239,
   Slot 3: 31240–31259, Slot 4: 31260–31279 (loopback only).
 - **Doppelstartschutz:** `start` auf laufendem Slot → Fehler.
+- **`release --keep-process`:** wird abgelehnt, solange ein Prozess läuft — so geht
+  keine Prozesszuordnung verloren. Erst `stop`, dann `release`.
 - **Healthcheck-Timeout:** `start` wartet bounded (Default 30 s) auf
   `GET /health = 200`; bei Timeout kontrolliertes Cleanup **ausschließlich des eigenen
-  Prozesses** (PID + Startzeit-Prüfung gegen PID-Recycling), Slot bleibt beim Besitzer.
-- **Bounded restart:** Default 2 Versuche, dann Endzustand mit Fehlern melden.
+  Prozesses** (PID + Startzeit-Prüfung gegen PID-Recycling). Jeder `start` erhält eine
+  **Startgeneration**: ein veralteter Timeout (oder -Erfolg) überschreibt den State eines
+  zwischenzeitlich neueren Starts nicht mehr — der neuere Start bleibt kontrollierbar.
+- **Bounded restart:** Default 2 Versuche, dann Endzustand mit gezählten Fehlern
+  („Versuch 1 … Versuch 2 …") melden; State endet sauber (`running=false`).
 - **Idle-Diagnose:** nach 2 h ohne Herzschlag meldet `status` `idle_diagnose: true`
   mit Hinweis — rein informativ, **keine** Löschung, kein Auto-Release, keine Cloud-API.
 - **DB-Adapter:** `db-refresh`/`db-backup` existieren, sind aber **bewusst ohne
@@ -45,8 +53,15 @@ python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Cre
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 10 Tests, u. a. konkurrierende Vergabe
+python3 -m unittest discover -s tests -v   # 19 Tests, u. a. echte 5-Prozess-Konkurrenz
 ```
+
+Abgedeckte Regressionen (QA Runde 1): echter paralleler Vergabetest mit 5 CLI-Prozessen
+(4 belegt, 5. abgewiesen), Lease-Wechsel mit laufendem Prozess (kein Doppelstart,
+`--steal`-Übernahme), `release --keep-process`-Ablehnung, Stale-Timeout-Race
+(Startgeneration), dokumentiertes `-- <Kommando>`-CLI, negative bounded-restart-Tests,
+aktiver Lease verhindert Idle-Diagnose. Kindprozesse werden deterministisch reaped
+(keine ResourceWarnings).
 
 Integrationstests starten einen realen Dummy-HTTP-Server auf loopback und fragen ihn
 per HTTP ab. Kein npm, kein Supabase, kein Docker.

@@ -62,13 +62,16 @@ class SlotState:
     log_path: str | None = None
     running: bool = False
     last_error: str | None = None
+    start_gen: int = 0  # Startgeneration: schützt gegen veraltete Operationen
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str) -> "SlotState":
-        return cls(**json.loads(text))
+        data = json.loads(text)
+        known = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 def _pid_starttime(pid: int) -> float | None:
@@ -117,6 +120,7 @@ class SlotManager:
         self.logs_dir = self.state_dir / "logs"
         self.logs_dir.mkdir(exist_ok=True)
         self.lease_seconds = lease_seconds
+        self._spawned: dict[int, subprocess.Popen] = {}  # pid -> Popen (Reaping)
 
     # ---------- Low-level State ----------
 
@@ -156,22 +160,33 @@ class SlotManager:
 
     # ---------- acquire / heartbeat / release ----------
 
-    def acquire(self, owner: str, slot: int | None = None) -> dict:
+    def acquire(self, owner: str, slot: int | None = None,
+                steal: bool = False) -> dict:
         """Belegt einen Slot atomar. Ohne slot-Wunsch: erster freier (oder
-        abgelaufener Lease) Slot, sonst SlotError 'alle belegt'."""
+        abgelaufener Lease) Slot, sonst SlotError 'alle belegt'.
+
+        Wichtig (Prozesszuordnung): Ist trotz abgelaufenem Lease/Owner=None
+        noch ein vom Manager gestarteter Prozess am Leben, wird der Slot
+        NICHT neu vergeben — der alte Owner kann mit seinem Token stoppen.
+        Nur mit steal=True wird dieser eigene (verwaiste) Prozess kontrolliert
+        beendet und der Slot übernommen."""
         with self._atomic():
             candidates = [slot] if slot else range(1, SLOT_COUNT + 1)
             for n in candidates:
                 st = self._read(n)
                 now = time.time()
                 free = st.owner is None or (st.lease_expiry or 0) < now
-                # ACHTUNG: abgelaufener Lease → Zuordnung wechselt, aber es
-                # werden KEINE Dateien/Prozesse gelöscht (ungesicherte Arbeit
-                # bleibt). Ein noch laufender Prozess wird NICHT getötet,
-                # sondern als orphan vermerkt.
-                orphan_note = None
                 if free and st.running and st.pid and _alive(st.pid, st.pid_starttime):
-                    orphan_note = f"vorheriger Prozess pid={st.pid} laeuft weiter"
+                    # Laufender Prozess gehört zur bisherigen Zuordnung —
+                    # weder löschen noch unkontrolliert neu vergeben.
+                    if not steal:
+                        raise SlotError(
+                            f"Slot {n}: Lease abgelaufen, aber Prozess "
+                            f"pid={st.pid} (Port {st.port}) laeuft noch. "
+                            "Alter Owner kann mit seinem Token stoppen; "
+                            "Uebernahme nur mit acquire --steal.")
+                    self._kill_own(st)
+                    free = True
                 if free:
                     token = uuid.uuid4().hex
                     new = SlotState(
@@ -179,11 +194,11 @@ class SlotManager:
                         acquired_at=now, lease_expiry=now + self.lease_seconds,
                         pid=None, pid_starttime=None, port=None,
                         log_path=st.log_path, running=False,
-                        last_error=orphan_note,
+                        last_error=None,
                     )
                     self._write(new)
                     return {"slot": n, "owner": owner, "token": token,
-                            "ports": slot_port_range(n), "orphan": orphan_note}
+                            "ports": slot_port_range(n)}
             if slot:
                 raise SlotError(f"Slot {slot} ist belegt (aktiver Lease)")
             raise SlotError("alle 4 Slots belegt (5. acquire abgewiesen)")
@@ -198,6 +213,13 @@ class SlotManager:
     def release(self, slot: int, token: str, stop_process: bool = True) -> dict:
         with self._atomic():
             st = self._require_owner(slot, token, "release")
+            if not stop_process and st.running and st.pid \
+                    and _alive(st.pid, st.pid_starttime):
+                # Prozesszuordnung nicht verlieren: ohne Stop kein Release.
+                raise SlotError(
+                    f"Slot {slot}: release --keep-process abgelehnt — es laeuft "
+                    f"noch ein Prozess (pid={st.pid}). Erst stop, oder release "
+                    "ohne --keep-process.")
             stopped = False
             if stop_process and st.running and st.pid:
                 stopped = self._kill_own(st)
@@ -239,6 +261,8 @@ class SlotManager:
                     stdout=logf, stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
+            st.start_gen = getattr(st, "start_gen", 0) + 1
+            my_gen = st.start_gen
             st.pid = proc.pid
             st.pid_starttime = _pid_starttime(proc.pid)
             st.port = port
@@ -246,23 +270,44 @@ class SlotManager:
             st.running = True
             st.last_error = None
             self._write(st)
+            my_pid, my_starttime = proc.pid, st.pid_starttime
+            self._spawned[proc.pid] = proc
 
         # Healthcheck außerhalb des Locks (blockiert keine Vergabe).
         ok, detail = self._wait_healthy(port, health_timeout)
         if ok:
-            return {"slot": slot, "pid": st.pid, "port": port,
-                    "healthy": True, "log": st.log_path}
-        # Timeout: kontrolliertes Cleanup ausschließlich des eigenen Prozesses.
-        self._kill_own(st)
+            res = {"slot": slot, "pid": my_pid, "port": port,
+                   "healthy": True, "log": st.log_path}
+            # Erfolgsweg: nichts zurückschreiben (könnte einen zwischenzeitlich
+            # neueren Start/stop überschreiben). Nur informieren, falls der
+            # Slot inzwischen nicht mehr uns gehört.
+            with self._atomic():
+                st_now = self._read(slot)
+            if st_now.token != token or st_now.start_gen != my_gen:
+                res["warning"] = ("Slot-State wurde zwischenzeitlich geaendert "
+                                  f"(Generation {st_now.start_gen} != {my_gen}) — "
+                                  "Prozess laeuft, gehoert aber nicht mehr zur "
+                                  "aktuellen Zuordnung")
+            return res
+        # Timeout: kontrolliertes Cleanup ausschließlich des eigenen Prozesses
+        # (unser Spawn, pid+starttime). State nur überschreiben, wenn die
+        # Startgeneration unverändert ist — sonst hat ein neuerer Start/stop
+        # das Slot übernommen und wir dürfen nichts umschreiben.
+        self._kill_own(SlotState(slot=slot, pid=my_pid, pid_starttime=my_starttime))
         with self._atomic():
             st2 = self._read(slot)
-            st2.running = False
-            st2.pid = None
-            st2.pid_starttime = None
-            st2.port = None
-            st2.last_error = f"healthcheck timeout nach {health_timeout}s: {detail}"
-            self._write(st2)
-        raise SlotError(st2.last_error)
+            if st2.token == token and st2.start_gen == my_gen and st2.pid == my_pid:
+                st2.running = False
+                st2.pid = None
+                st2.pid_starttime = None
+                st2.port = None
+                st2.last_error = f"healthcheck timeout nach {health_timeout}s: {detail}"
+                self._write(st2)
+                raise SlotError(st2.last_error)
+            raise SlotError(
+                f"healthcheck timeout nach {health_timeout}s: {detail} — "
+                f"aber Slot-State inzwischen geaendert (Generation "
+                f"{st2.start_gen} != {my_gen}); kein Cleanup geschrieben")
 
     def _free_port(self, lo: int, hi: int) -> int:
         for p in range(lo, hi + 1):
@@ -317,6 +362,19 @@ class SlotManager:
             time.sleep(0.1)
         with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(pid), signal.SIGKILL)
+        # Kindprozess deterministisch einsammeln (kein ResourceWarning/Zombie):
+        proc = self._spawned.pop(pid, None)
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=15)
+        else:
+            # Fremde Manager-Instanz: blockierend einsammeln, wenn Kind.
+            with contextlib.suppress(ChildProcessError, OSError):
+                os.waitpid(pid, 0)
+        for _ in range(30):
+            if not _alive(pid, t0):
+                return True
+            time.sleep(0.1)
         return _alive(pid, t0) is False
 
     def stop(self, slot: int, token: str) -> dict:
