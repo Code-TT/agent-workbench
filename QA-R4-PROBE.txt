@@ -1,0 +1,14 @@
+CORRUPT STATE: acquire rejected -> Slot 4: State korrupt/unlesbar — fail-closed, keine Vergabe/Start (Datei erhalte ...
+CORRUPT STATE: start rejected
+CORRUPT STATE: file unchanged = True
+CORRUPT STATE: original HTTP still healthy = ok
+CORRUPT STATE: status state_error present = True
+RECOVERY: stopped = True recovered start healthy = True new pid differs = True
+MOCKED IDENTITY FAIL: start rejected -> Prozessidentitaet (Startzeit) nicht ermittelbar — start abgebrochen, k ...
+MOCKED IDENTITY FAIL: state pid = None running = False probe_calls = 1
+MOCKED IDENTITY FAIL: slot port silent, child reaped via own handle
+PERMS: {"dir": "0o700", "logs_dir": "0o700", "slot4": "0o600", "slot1": "0o600", "lock": "0o600"}
+PERMS: token in status output = False
+IDLE: lease_expired = True idle_diagnose = False idle_seconds = 0
+IDLE: after 3h without heartbeat -> idle_diagnose = True | note present = True
+ALL R4 REPROS: PASS

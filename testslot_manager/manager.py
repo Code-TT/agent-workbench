@@ -63,6 +63,7 @@ class SlotState:
     running: bool = False
     last_error: str | None = None
     start_gen: int = 0  # Startgeneration: schützt gegen veraltete Operationen
+    last_heartbeat: float | None = None  # Basis für Idle-Diagnose (2h-Regel)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, sort_keys=True)
@@ -99,15 +100,18 @@ def _pid_starttime(pid: int) -> float | None:
 
 
 def _alive(pid: int, starttime: float | None) -> bool:
-    """Prüft, ob genau dieser Prozess (PID + Startzeit) noch lebt."""
-    if pid is None or pid <= 0:
+    """Prüft, ob genau dieser Prozess (PID + Startzeit) noch lebt.
+
+    Fail-closed: Ohne bekannte Startzeit kann Identität NICHT nachgewiesen
+    werden (PID-Recycling) — dann gilt der Prozess als nicht sicher
+    zuzuordnen (False). Kein Kill, keine Übernahme auf dieser Basis.
+    """
+    if pid is None or pid <= 0 or starttime is None:
         return False
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
         return False
-    if starttime is None:
-        return True
     return _pid_starttime(pid) == starttime
 
 
@@ -115,10 +119,17 @@ class SlotManager:
     def __init__(self, state_dir: str | Path | None = None, lease_seconds: int = 900):
         base = os.environ.get("TESTSLOT_STATE_DIR")
         self.state_dir = Path(state_dir or base or Path.home() / ".testslot-manager")
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        # Restriktive Rechte unabhängig vom Pfad (Standard ODER explizit):
+        # 0700 für Verzeichnisse, 0600 für State-/Lock-/Log-Dateien — der
+        # Ownership-Token liegt im State und darf nicht world-readable sein.
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            os.chmod(self.state_dir, 0o700)
         self.lock_path = self.state_dir / "slots.lock"
         self.logs_dir = self.state_dir / "logs"
-        self.logs_dir.mkdir(exist_ok=True)
+        self.logs_dir.mkdir(exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            os.chmod(self.logs_dir, 0o700)
         self.lease_seconds = lease_seconds
         self._spawned: dict[int, subprocess.Popen] = {}  # pid -> Popen (Reaping)
 
@@ -129,6 +140,8 @@ class SlotManager:
         """Exklusiver Lock über alle Slot-Operationen (atomare Vergabe)."""
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
+            with contextlib.suppress(OSError):
+                os.chmod(self.lock_path, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
         finally:
@@ -145,18 +158,36 @@ class SlotManager:
         if not p.exists():
             return SlotState(slot=slot)
         try:
-            return SlotState.from_json(p.read_text())
-        except Exception:
-            # Korrupte Datei: nicht löschen, sondern neutral zurücksetzen.
-            s = SlotState(slot=slot)
-            s.last_error = "state korrupt, zurueckgesetzt"
-            return s
+            text = p.read_text()
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise ValueError("State ist kein JSON-Objekt")
+            return SlotState.from_json(text)
+        except SlotError:
+            raise
+        except Exception as e:
+            # Fail-closed: korrupter/unlesbarer State ist KEIN neutraler
+            # freier Slot. Kein Doppelstart, keine Vergabe, kein Start —
+            # und die Originaldatei wird nicht überschrieben. Recovery:
+            # Datei manuell reparieren (Token steht darin) bzw. aus
+            # Sicherung wiederherstellen, danach normal stoppen/acquire.
+            raise SlotError(
+                f"Slot {slot}: State korrupt/unlesbar — fail-closed, "
+                f"keine Vergabe/Start (Datei erhalten: {p}): {e}") from e
 
     def _write(self, state: SlotState) -> None:
         p = self._state_path(slot := state.slot)
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(state.to_json())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, state.to_json().encode())
+        finally:
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, 0o600)
         os.replace(tmp, p)  # atomar
+        with contextlib.suppress(OSError):
+            os.chmod(p, 0o600)
 
     # ---------- acquire / heartbeat / release ----------
 
@@ -176,6 +207,16 @@ class SlotManager:
                 st = self._read(n)
                 now = time.time()
                 free = st.owner is None or (st.lease_expiry or 0) < now
+                if free and st.running and st.pid and st.pid_starttime is None:
+                    # Identität der laufenden Zuordnung nicht nachweisbar
+                    # (z. B. Legacy-State): fail-closed — kein Kill, keine
+                    # Übernahme, kein Doppelstart. Manuelle Reparatur nötig.
+                    if slot is None:
+                        continue
+                    raise SlotError(
+                        f"Slot {n}: laufender Prozess pid={st.pid} ohne "
+                        "nachweisbare Startzeit — Identitaet ungesichert, "
+                        "Uebernahme/Kill abgelehnt (State manuell reparieren)")
                 if free and st.running and st.pid and _alive(st.pid, st.pid_starttime):
                     # Laufender Prozess gehört zur bisherigen Zuordnung —
                     # weder löschen noch unkontrolliert neu vergeben.
@@ -211,6 +252,7 @@ class SlotManager:
         with self._atomic():
             st = self._require_owner(slot, token, "heartbeat")
             st.lease_expiry = time.time() + self.lease_seconds
+            st.last_heartbeat = time.time()
             self._write(st)
             return {"slot": slot, "lease_expiry": st.lease_expiry}
 
@@ -250,6 +292,11 @@ class SlotManager:
         cmd = command or [sys.executable, "-m", "testslot_manager.dummy_server"]
         with self._atomic():
             st = self._require_owner(slot, token, "start")
+            if st.running and st.pid and st.pid_starttime is None:
+                raise SlotError(
+                    f"Slot {slot}: laufende Prozesszuordnung (pid={st.pid}) "
+                    "ohne nachweisbare Startzeit — Doppelstartschutz "
+                    "fail-closed, State manuell reparieren")
             if st.running and st.pid and _alive(st.pid, st.pid_starttime):
                 raise SlotError(f"Slot {slot} laeuft bereits (pid={st.pid}) — Doppelstart abgewiesen")
             lo, hi = slot_port_range(slot)
@@ -272,18 +319,41 @@ class SlotManager:
                     cmd, env=env,
                     stdout=logf, stderr=subprocess.STDOUT,
                     start_new_session=True,
-                )
+            )
+            try:
+                os.chmod(log_path, 0o600)
+            except OSError:
+                pass
+            self._spawned[proc.pid] = proc
             st.start_gen = getattr(st, "start_gen", 0) + 1
             my_gen = st.start_gen
+            t0 = _pid_starttime(proc.pid)
+            if t0 is None:
+                # Identitätsermittlung fehlgeschlagen: NICHT persistieren
+                # (kein pid/starttime-Eintrag, kein gesunder Start möglich),
+                # Kind über den EIGENEN Handle sicher beenden/reapen — kein
+                # Kill auf unbekannter Grundlage.
+                with contextlib.suppress(Exception):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    proc.wait(timeout=15)
+                if proc.poll() is None:
+                    with contextlib.suppress(Exception):
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=15)
+                self._spawned.pop(proc.pid, None)
+                raise SlotError(
+                    "Prozessidentitaet (Startzeit) nicht ermittelbar — "
+                    "start abgebrochen, kein State-Eintrag, Prozess "
+                    "ueber eigenen Handle beendet")
             st.pid = proc.pid
-            st.pid_starttime = _pid_starttime(proc.pid)
+            st.pid_starttime = t0
             st.port = port
             st.log_path = str(log_path)
             st.running = True
             st.last_error = None
             self._write(st)
             my_pid, my_starttime = proc.pid, st.pid_starttime
-            self._spawned[proc.pid] = proc
 
         # Healthcheck außerhalb des Locks (blockiert keine Vergabe).
         ok, detail = self._wait_healthy(port, health_timeout)
@@ -379,9 +449,12 @@ class SlotManager:
         return False, last or "kein Antwortversuch"
 
     def _kill_own(self, st: SlotState) -> bool:
-        """Beendet NUR den vom Manager gestarteten Prozess (PID+Startzeit-Prüfung)."""
+        """Beendet NUR den vom Manager gestarteten Prozess (PID+Startzeit).
+
+        Fail-closed: Ohne bekannte Startzeit wird NICHTS signalisiert —
+        eine recycelte/fremde PID kann so nie getroffen werden."""
         pid, t0 = st.pid, st.pid_starttime
-        if not pid or not _alive(pid, t0):
+        if not pid or t0 is None or not _alive(pid, t0):
             return False
         with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(pid), signal.SIGTERM)
@@ -458,22 +531,34 @@ class SlotManager:
         now = time.time()
         out = {}
         for n in range(1, SLOT_COUNT + 1):
-            st = self._read(n)
+            try:
+                st = self._read(n)
+            except SlotError as e:
+                # Fail-closed sichtbar machen, ohne status() abstürzen zu lassen.
+                out[f"slot-{n}"] = {"slot": n, "state_error": str(e)}
+                continue
+            # Idle-Diagnose misst seit dem LETZTEN Herzschlag (Fallback:
+            # acquired_at), nicht seit dem Erwerb. Lease-Ablauf allein genügt
+            # nicht; erst 2h ohne Herzschlag + abgelaufener Lease.
+            hb_ref = st.last_heartbeat or st.acquired_at
+            idle_seconds = int(now - hb_ref) if hb_ref else 0
             entry = {
                 "owner": st.owner,
                 "running": bool(st.running and st.pid and _alive(st.pid, st.pid_starttime)),
                 "pid": st.pid,
                 "port": st.port,
                 "lease_expired": bool(st.lease_expiry and st.lease_expiry < now),
-                "idle_seconds": int(now - (st.acquired_at or now)),
-                "idle_diagnose": bool(st.owner and st.lease_expiry and st.lease_expiry < now
-                                      and (now - (st.acquired_at or now)) >= IDLE_DIAGNOSE_SECONDS),
+                "last_heartbeat": st.last_heartbeat,
+                "idle_seconds": idle_seconds,
+                "idle_diagnose": bool(st.owner and st.lease_expiry
+                                      and st.lease_expiry < now
+                                      and hb_ref and now - hb_ref >= IDLE_DIAGNOSE_SECONDS),
                 "last_error": st.last_error,
             }
             if entry["idle_diagnose"]:
                 # Reine Diagnose: Hinweis, KEINE Löschung/Freigabe.
-                entry["note"] = ("idle >2h mit abgelaufenem Lease — nur Diagnose; "
-                                 "ungesicherte Arbeit wird nicht beruehrt")
+                entry["note"] = ("idle >2h ohne Herzschlag bei abgelaufenem Lease — "
+                                 "nur Diagnose; ungesicherte Arbeit wird nicht beruehrt")
             out[f"slot-{n}"] = entry
         return out
 

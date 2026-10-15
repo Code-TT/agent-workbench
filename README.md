@@ -59,13 +59,35 @@ python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Cre
   („Versuch 1 … Versuch 2 …") melden; State endet sauber (`running=false`).
 - **Idle-Diagnose:** nach 2 h ohne Herzschlag meldet `status` `idle_diagnose: true`
   mit Hinweis — rein informativ, **keine** Löschung, kein Auto-Release, keine Cloud-API.
+- **State fail-closed:** Eine korrupte/unlesbare `slot-<n>.json` ist **kein** neutraler
+  freier Slot: `acquire`/`start`/`stop`/`heartbeat` werden mit `SlotError` abgelehnt,
+  die Originaldatei wird **nicht überschrieben**, es gibt keinen Doppelstart und keinen
+  Datenverlust. `status` zeigt den Slot mit `state_error` statt abzustürzen. Recovery:
+  State-Datei manuell reparieren (der Token steht darin) bzw. aus Sicherung
+  wiederherstellen, danach regulär `stop`/`acquire`.
+- **Prozessidentität (fail-closed):** Ein Kill oder eine Übernahme erfolgt nur mit
+  **nachweislicher** PID+Startzeit-Identität. Unbekannte/undefinierbare Startzeit
+  (z. B. Legacy-State oder fehlgeschlagene Identitätsermittlung) → **kein Signal,
+  keine Zuordnung, keine Übernahme**: `acquire`/`start` auf solche Slots wird
+  abgewiesen (Auto-Vergabe überspringt sie). Schlägt die Startzeit-Ermittlung direkt
+  nach dem Spawn fehl, persistiert `start` nichts und beendet den soeben gespawnten
+  eigenen Kindprozess über den eigenen Popen-Handle — niemals Signale auf
+  unbekannter Grundlage (PID-Recycling-Schutz).
+- **Idle-Diagnose seit letztem Herzschlag:** `status` misst `idle_seconds` ab
+  `last_heartbeat` (Fallback: `acquired_at`); die Diagnose (`idle_diagnose`) greift
+  erst bei **2 h ohne Heartbeat** UND abgelaufenem Lease — ein Lease-Ablauf allein
+  genügt nicht. Rein informativ, keine Löschung/Aktion.
+- **Restriktive Dateirechte:** State-Verzeichnis, `logs/` und Lock-Datei erhalten
+  `0700`, State-/Log-Dateien `0600` — unabhängig davon, ob der Standardpfad oder ein
+  expliziter `TESTSLOT_STATE_DIR` genutzt wird. Der Ownership-Token (Bearer) liegt
+  im State und ist damit nicht world-readable; `status`/`logs` geben Token nicht aus.
 - **DB-Adapter:** `db-refresh`/`db-backup` existieren, sind aber **bewusst ohne
   Credentials nicht verfügbar** und werfen hart einen Fehler (keine Erfolgssimulation).
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 22 Tests, u. a. echte 5-Prozess-Konkurrenz
+python3 -m unittest discover -s tests -v   # 28 Tests, u. a. echte 5-Prozess-Konkurrenz
 ```
 
 Abgedeckte Regressionen (QA Runde 1 + 2): echter paralleler Vergabetest mit 5 CLI-Prozessen
@@ -77,6 +99,13 @@ belegter expliziter Port wird vor Spawn abgelehnt (fremder Listener ≠ eigener 
 stop während der Erfolgs-Finalisierung wird als abgebrochener Start gemeldet.
 Kindprozesse werden deterministisch reaped (keine ResourceWarnings).
 
+Härtungs-Regressionen (Rework t_0744b32c): korrupter State fail-closed mit echtem
+Loopback-Prozess (kein Doppelstart, Datei erhalten, dokumentierte Recovery),
+isolierter gemockter PID-Identitätsausfall (kein State-Eintrag, kein fremder Kill,
+eigenes Kind reapet), kein Kill/keine Übernahme bei unbekannter Startzeit,
+Idle-Diagnose seit letztem Heartbeat, POSIX-Modi 0700/0600 bei Standard- und
+explizitem Pfad, Token nicht in `status`-Ausgabe.
+
 Integrationstests starten einen realen Dummy-HTTP-Server auf loopback und fragen ihn
 per HTTP ab. Kein npm, kein Supabase, kein Docker.
 
@@ -85,7 +114,8 @@ per HTTP ab. Kein npm, kein Supabase, kein Docker.
 - Kein VPS-Deployment, keine Cloud-Aktionen, kein Supabase-Start — nur loopback-Prozesse.
 - `db-refresh`/`db-backup` nicht verfügbar (Zugänge zur externen Dev-Supabase ungeklärt).
 - Keine Secrets: der Manager sammelt/protokolliert keine Credentials.
-- State liegt unter `~/.testslot-manager/` (überschreibbar via `TESTSLOT_STATE_DIR`).
+- State liegt unter `~/.testslot-manager/` (überschreibbar via `TESTSLOT_STATE_DIR`,
+  immer `0700`/`0600`-restriktiv).
 
 ## Rollback
 

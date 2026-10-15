@@ -12,6 +12,7 @@
 Der Dummy-Server wird real gestartet und per HTTP abgefragt.
 """
 import concurrent.futures
+import contextlib
 import json
 import os
 import socket
@@ -40,7 +41,10 @@ class Base(unittest.TestCase):
     def tearDown(self):
         # Aufräumen: alle eigenen Prozesse stoppen, State-Dir wegwerfen.
         for n in range(1, m.SLOT_COUNT + 1):
-            st = self.mgr._read(n)
+            try:
+                st = self.mgr._read(n)
+            except SlotError:
+                continue  # korrupter State: fail-closed, nichts überschreiben
             if st.token:
                 try:
                     self.mgr.stop(n, st.token)
@@ -509,6 +513,172 @@ class TestQARunde2(Base):
         self.assertFalse(st.running)
         self.assertIsNone(st.pid)
         self.assertFalse(race.status()["slot-1"]["running"])
+
+
+class TestQARunde4(Base):
+    """Härtung t_0744b32c: State fail-closed, Prozessidentität,
+    Heartbeat-basierte Idle-Diagnose, restriktive Dateirechte."""
+
+    def _dummy_cmd(self):
+        return [sys.executable, "-m", "testslot_manager.dummy_server"]
+
+    # ---------- (1) Korrupter State: fail-closed, Datei erhalten ----------
+
+    def test_korrupter_state_fail_closed_kein_doppelstart_kein_ueberschreiben(self):
+        a = self.mgr.acquire("a", slot=1)
+        first = self.mgr.start(1, a["token"], command=self._dummy_cmd(),
+                               health_timeout=5)
+        p = Path(self.tmp.name) / "slot-1.json"
+        good = p.read_text()
+        p.write_text("{broken-json")
+        # kein zweiter acquire/start:
+        with self.assertRaises(SlotError) as cm:
+            self.mgr.acquire("b", slot=1)
+        self.assertIn("korrupt", str(cm.exception))
+        with self.assertRaises(SlotError):
+            self.mgr.start(1, "irgendein-token", command=self._dummy_cmd(),
+                           health_timeout=2)
+        # Originaldatei unangetastet:
+        self.assertEqual(p.read_text(), "{broken-json")
+        # alter Prozess lebt weiter und antwortet weiter:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{first['port']}/health", timeout=3) as resp:
+            self.assertEqual(resp.read(), b"ok")
+        st_probe = self.mgr.status()["slot-1"]
+        self.assertIn("state_error", st_probe)
+        # Recovery (dokumentiert): Datei reparieren, dann regulärer stop
+        p.write_text(good)
+        self.assertTrue(self.mgr.stop(1, a["token"])["stopped"])
+        time.sleep(0.2)
+        self.mgr.release(1, a["token"])
+        self.assertEqual(self.mgr.acquire("c", slot=1)["slot"], 1)
+
+    def test_status_zeigt_korrupten_slot_ohne_absturz(self):
+        self.mgr.acquire("a", slot=2)
+        (Path(self.tmp.name) / "slot-2.json").write_text("nope")
+        status = self.mgr.status()
+        self.assertIn("state_error", status["slot-2"])
+        self.assertIn("owner", status["slot-1"])  # Rest normal
+
+    # ---------- (2) Prozessidentität: kein Kill ohne Startzeit ----------
+
+    def test_unbekannte_startzeit_kein_kill_keine_uebernahme(self):
+        # Echter eigener Sleep-Prozess, State mit pid aber starttime=None:
+        proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"],
+                                start_new_session=True)
+        try:
+            fake = m.SlotState(slot=1, owner="a", token="tok", acquired_at=time.time(),
+                               lease_expiry=time.time() - 1, pid=proc.pid,
+                               pid_starttime=None, running=True)
+            self.mgr._write(fake)
+            self.assertFalse(m._alive(proc.pid, None))
+            self.assertFalse(self.mgr._kill_own(fake))  # KEIN Signal
+            with self.assertRaises(SlotError) as cm:
+                self.mgr.acquire("b", slot=1)
+            self.assertIn("Startzeit", str(cm.exception))
+            self.assertIsNone(proc.poll())  # Prozess lebt — nicht getroffen
+            # Nachträgliche Identitätsermittlung erlaubt kontrolliertes Reapen:
+            fake.pid_starttime = m._pid_starttime(proc.pid)
+            self.assertTrue(self.mgr._kill_own(fake))
+            self.assertIsNotNone(proc.wait(timeout=15))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=15)
+
+    def test_start_bei_fehlender_identitaet_persistiert_nichts_startet_nicht(self):
+        # Isolierter gemockter PID-Identitätsausfall (Ermittlung liefert None):
+        a = self.mgr.acquire("a", slot=1)
+        calls = []
+        orig = m._pid_starttime
+        m._pid_starttime = lambda pid: (calls.append(pid), None)[1]
+        try:
+            with self.assertRaises(SlotError) as cm:
+                self.mgr.start(1, a["token"], command=self._dummy_cmd(),
+                               health_timeout=2)
+        finally:
+            m._pid_starttime = orig
+        self.assertIn("identitaet", str(cm.exception))
+        self.assertTrue(calls)  # Identitätsprüfung wurde versucht
+        st = self.mgr._read(1)
+        self.assertIsNone(st.pid)
+        self.assertIsNone(st.pid_starttime)
+        self.assertFalse(st.running)
+        # Der gespawnte Kindprozess wurde reapet (kein ResourceWarning/Zombie):
+        time.sleep(0.3)
+        log = Path(self.tmp.name) / "logs" / "slot-1.log"
+        # kein Prozess mehr am Slot-Port:
+        with self.assertRaises(Exception):
+            urllib.request.urlopen("http://127.0.0.1:31200/health", timeout=1)
+        self.assertTrue(self.mgr.status()["slot-1"]["running"] is False)
+
+    # ---------- (3) Idle-Diagnose seit letztem Herzschlag ----------
+
+    def test_idle_diagnose_misst_seit_heartbeat_nicht_seit_acquire(self):
+        r = self.mgr.acquire("a", slot=1)
+        self.mgr.heartbeat(1, r["token"])
+        with self.mgr._atomic():
+            st = self.mgr._read(1)
+            st.acquired_at = time.time() - 3 * 3600  # Erwerb sehr alt
+            st.lease_expiry = time.time() - 1        # Lease abgelaufen
+            self.mgr._write(st)
+        status = self.mgr.status()["slot-1"]
+        # Lease abgelaufen + alter Erwerb, aber frischer Herzschlag:
+        self.assertTrue(status["lease_expired"])
+        self.assertFalse(status["idle_diagnose"])
+        self.assertLess(status["idle_seconds"], 600)
+        self.assertNotIn("note", status)
+        # Erst 2h OHNE Herzschlag (+ abgelaufener Lease) → Diagnose:
+        with self.mgr._atomic():
+            st = self.mgr._read(1)
+            st.last_heartbeat = time.time() - 3 * 3600
+            self.mgr._write(st)
+        status = self.mgr.status()["slot-1"]
+        self.assertTrue(status["idle_diagnose"])
+        self.assertIn("nicht beruehrt", status["note"])
+
+    # ---------- (4) Dateirechte / Token-Exposition ----------
+
+    def test_state_dateirechte_restriktiv_standard_und_explizit(self):
+        self.mgr.acquire("a", slot=1)  # state_dir explizit per Parameter
+        base = Path(self.tmp.name)
+        self.assertEqual(base.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((base / "logs").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((base / "slot-1.json").stat().st_mode & 0o777, 0o600)
+        self.mgr.heartbeat(1, self.mgr._read(1).token or "")
+        self.assertEqual((base / "slot-1.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((base / "slots.lock").stat().st_mode & 0o777, 0o600)
+        # Standardpfad via TESTSLOT_STATE_DIR (explizite Umgebungsvariable):
+        other = tempfile.mkdtemp(prefix="tsm-perm-")
+        old = os.environ.get("TESTSLOT_STATE_DIR")
+        os.environ["TESTSLOT_STATE_DIR"] = other
+        mgr2 = None
+        try:
+            mgr2 = m.SlotManager()
+            mgr2.acquire("b", slot=2)
+            ob = Path(other)
+            self.assertEqual(ob.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((ob / "slot-2.json").stat().st_mode & 0o777, 0o600)
+        finally:
+            if old is None:
+                os.environ.pop("TESTSLOT_STATE_DIR", None)
+            else:
+                os.environ["TESTSLOT_STATE_DIR"] = old
+            for n in range(1, m.SLOT_COUNT + 1):
+                if mgr2 is None:
+                    break
+                try:
+                    st = mgr2._read(n)
+                except SlotError:
+                    continue
+                if st.token:
+                    with contextlib.suppress(Exception):
+                        mgr2.release(n, st.token)
+            import shutil
+            shutil.rmtree(other, ignore_errors=True)
+        # Token nicht über status/logs ausgegeben:
+        blob = json.dumps(self.mgr.status())
+        self.assertNotIn(self.mgr._read(1).token or "___none___", blob)
 
 
 if __name__ == "__main__":

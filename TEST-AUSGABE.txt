@@ -1,4 +1,4 @@
-=== unittest-Suite nach QA-Runde-2-Rework 2026-10-15 17:19:01 ===
+== Acceptance: python3 -W error::ResourceWarning -m unittest discover -s tests -v ==
 test_konkurrierende_vergabe_4_slots_5ter_abgewiesen (test_slots.TestAcquire) ... ok
 test_owner_schutz (test_slots.TestAcquire) ... ok
 test_slot_wunsch_belegt_abgewiesen (test_slots.TestAcquire) ... ok
@@ -18,18 +18,41 @@ test_start_healthcheck_stop (test_slots.TestProcess) ... ok
 test_auto_acquire_ueberspringt_verwaisten_slot (test_slots.TestQARunde2) ... ok
 test_belegter_expliziter_port_wird_abgelehnt_kein_fremd_listener (test_slots.TestQARunde2) ... ok
 test_stop_waehrend_success_finalisierung_meldet_keinen_gesunden_start (test_slots.TestQARunde2) ... ok
+test_idle_diagnose_misst_seit_heartbeat_nicht_seit_acquire (test_slots.TestQARunde4) ... ok
+test_korrupter_state_fail_closed_kein_doppelstart_kein_ueberschreiben (test_slots.TestQARunde4) ... ok
+test_start_bei_fehlender_identitaet_persistiert_nichts_startet_nicht (test_slots.TestQARunde4) ... ok
+test_state_dateirechte_restriktiv_standard_und_explizit (test_slots.TestQARunde4) ... ok
+test_status_zeigt_korrupten_slot_ohne_absturz (test_slots.TestQARunde4) ... ok
+test_unbekannte_startzeit_kein_kill_keine_uebernahme (test_slots.TestQARunde4) ... ok
 test_restart_max_attempts_1_nur_ein_versuch (test_slots.TestRestartBoundedNegativ) ... ok
 test_restart_scheitert_nach_max_attempts_mit_zaehlung (test_slots.TestRestartBoundedNegativ) ... ok
 test_alter_timeout_ueberschreibt_neuen_start_nicht (test_slots.TestStaleTimeoutRace) ... ok
 
 ----------------------------------------------------------------------
-Ran 22 tests in 161.401s
+Ran 28 tests in 169.765s
 
 OK
-rc=0
+EXIT=0
 
-=== QA-R2-Probe nach Fix (muss alle 3 Szenarien korrekt behandeln) ===
+== qa_r2_probe.py (unveraendert, Runde-2-Repros) ==
 AUTO ACQUIRE with slots 2..4 free: assigned 2
 OCCUPIED EXPLICIT PORT rejected: Port 31200 ist bereits belegt — start abgelehnt (kein fremder Listener als eigener Start akzeptiert)
 STOP DURING SUCCESS FINALIZATION: returned healthy= False actual running= False warning= start nicht als gesunder Erfolg gueltig: Slot-State wurde zwischenzeitlich gestoppt/geaendert (pid/gen/running-Identitaet verletzt; state_pid=None, gen=1, running=False) — kein State-Restore errors= []
-probe rc=0
+EXIT=0
+
+== qa_r4_probe.py (Härtungs-Repros t_0744b32c) ==
+CORRUPT STATE: acquire rejected -> Slot 4: State korrupt/unlesbar — fail-closed, keine Vergabe/Start (Datei erhalte ...
+CORRUPT STATE: start rejected
+CORRUPT STATE: file unchanged = True
+CORRUPT STATE: original HTTP still healthy = ok
+CORRUPT STATE: status state_error present = True
+RECOVERY: stopped = True recovered start healthy = True new pid differs = True
+MOCKED IDENTITY FAIL: start rejected -> Prozessidentitaet (Startzeit) nicht ermittelbar — start abgebrochen, k ...
+MOCKED IDENTITY FAIL: state pid = None running = False probe_calls = 1
+MOCKED IDENTITY FAIL: slot port silent, child reaped via own handle
+PERMS: {"dir": "0o700", "logs_dir": "0o700", "slot4": "0o600", "slot1": "0o600", "lock": "0o600"}
+PERMS: token in status output = False
+IDLE: lease_expired = True idle_diagnose = False idle_seconds = 0
+IDLE: after 3h without heartbeat -> idle_diagnose = True | note present = True
+ALL R4 REPROS: PASS
+EXIT=0
