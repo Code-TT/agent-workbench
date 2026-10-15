@@ -14,6 +14,7 @@ Der Dummy-Server wird real gestartet und per HTTP abgefragt.
 import concurrent.futures
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -396,6 +397,118 @@ class TestIdleAktivLease(Base):
         r = self.mgr.acquire("b", slot=3)
         self.mgr.heartbeat(3, r["token"])
         self.assertFalse(self.mgr.status()["slot-3"]["idle_diagnose"])
+
+
+class TestQARunde2(Base):
+    """Regression QA Runde 2: Auto-Vergabe überspringt verwaiste Slots,
+    belegter expliziter Port wird vor Spawn abgelehnt, Erfolgsweg validiert
+    Identität gegen zwischenzeitlichen stop."""
+
+    def _dummy_cmd(self):
+        return [sys.executable, "-m", "testslot_manager.dummy_server"]
+
+    def test_auto_acquire_ueberspringt_verwaisten_slot(self):
+        a = self.mgr.acquire("a", slot=1)
+        first = self.mgr.start(1, a["token"], command=self._dummy_cmd(),
+                               health_timeout=5)
+        # Lease ablaufen lassen, Prozess läuft als Verwaister weiter
+        with self.mgr._atomic():
+            st = self.mgr._read(1)
+            st.lease_expiry = time.time() - 1
+            self.mgr._write(st)
+        # Auto-Vergabe: Slot 1 überspringen, Slot 2 vergeben (Slots 2..4 frei)
+        b = self.mgr.acquire("b")
+        self.assertEqual(b["slot"], 2)
+        # Slot-1-Zuordnung unangetastet:
+        st = self.mgr._read(1)
+        self.assertEqual(st.pid, first["pid"])
+        self.assertEqual(st.token, a["token"])
+        self.assertEqual(st.port, first["port"])
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{first['port']}/health", timeout=3) as resp:
+            self.assertEqual(resp.read(), b"ok")
+        # expliziter Wunsch auf verwaisten Slot bleibt abgewiesen:
+        with self.assertRaises(SlotError) as cm:
+            self.mgr.acquire("c", slot=1)
+        self.assertIn("laeuft noch", str(cm.exception))
+        self.mgr.stop(2, b["token"])
+        self.mgr.stop(1, a["token"])
+
+    def test_belegter_expliziter_port_wird_abgelehnt_kein_fremd_listener(self):
+        # Freien Port dynamisch aus dem Slot-2-Bereich (31220-31239) waehlen:
+        # hartkodierte Ports kollidieren mit Überbleibseln anderer Läufe.
+        occ_port = None
+        for cand in range(31220, 31240):
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", cand))
+                occ_port = cand
+            except OSError:
+                continue
+            finally:
+                s.close()
+            if occ_port is not None:
+                break
+        self.assertIsNotNone(occ_port)
+        # Fremder (eigener Test-)Listener auf einem Slot-2-Port:
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", occ_port))
+        srv.listen(1)
+        try:
+            a = self.mgr.acquire("a", slot=2)
+            with self.assertRaises(SlotError) as cm:
+                self.mgr.start(2, a["token"], command=self._dummy_cmd(),
+                               port=occ_port, health_timeout=2)
+            self.assertIn("bereits belegt", str(cm.exception))
+            # Es wurde KEIN Prozess gespawnt, kein fremder HTTP-Traffic gemessen:
+            st = self.mgr._read(2)
+            self.assertIsNone(st.pid)
+            self.assertFalse(st.running)
+        finally:
+            srv.close()
+        # Zusätzlich: sofort beendendes Kommando auf freiem explizitem Port ->
+        # regulärer Healthcheck-Timeout, kein falscher Erfolg (Owner "a" hält
+        # den Slot weiter, rejected start hat keinen Prozess erzeugt):
+        with self.assertRaises(SlotError) as cm:
+            self.mgr.start(2, a["token"],
+                           command=[sys.executable, "-c", "pass"],
+                           port=occ_port, health_timeout=2)
+        self.assertIn("healthcheck timeout", str(cm.exception))
+        st = self.mgr._read(2)
+        self.assertFalse(st.running)
+        self.assertIsNone(st.pid)
+
+    def test_stop_waehrend_success_finalisierung_meldet_keinen_gesunden_start(self):
+        class StopDuringHealth(m.SlotManager):
+            """Simuliert parallel stop exakt zwischen Healthcheck-Erfolg und
+            Finalisierung (deterministische Barriere statt Sleep-Race)."""
+            def __init__(self, *args, stop_slot=None, stop_token=None, **kw):
+                super().__init__(*args, **kw)
+                self._stop_slot = stop_slot
+                self._stop_token = stop_token
+
+            def _wait_healthy(self, port, timeout):
+                ok, detail = super()._wait_healthy(port, timeout)
+                self.stop(self._stop_slot, self._stop_token)  # echter paralleler stop
+                return ok, detail
+
+        race = StopDuringHealth(state_dir=self.tmp.name, lease_seconds=60,
+                                stop_slot=1, stop_token=None)
+        a = race.acquire("a", slot=1)
+        race._stop_token = a["token"]
+        res = race.start(1, a["token"], command=self._dummy_cmd(),
+                         health_timeout=5)
+        # HTTP war gesund, aber der Start wurde während der Finalisierung
+        # gestoppt -> KEIN stiller gesunder Erfolg:
+        self.assertFalse(res["healthy"])
+        self.assertIn("nicht als gesunder Erfolg", res["warning"])
+        self.assertIn("gestoppt", res["warning"])
+        st = race._read(1)
+        self.assertFalse(st.running)
+        self.assertIsNone(st.pid)
+        self.assertFalse(race.status()["slot-1"]["running"])
 
 
 if __name__ == "__main__":

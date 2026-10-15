@@ -43,6 +43,18 @@ python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Cre
   Prozesses** (PID + Startzeit-Prüfung gegen PID-Recycling). Jeder `start` erhält eine
   **Startgeneration**: ein veralteter Timeout (oder -Erfolg) überschreibt den State eines
   zwischenzeitlich neueren Starts nicht mehr — der neuere Start bleibt kontrollierbar.
+- **`acquire` ohne Slot-Wunsch (Auto-Vergabe):** überspringt verwaiste Slots
+  (abgelaufener Lease + lebendiger Prozess) und vergibt den nächsten freien —
+  ein verwaister Slot blockiert die Vergabe der übrigen Slots nicht. Expliziter
+  `--slot`-Wunsch auf einen verwaisten Slot bleibt abgewiesen (Schutz wie oben).
+- **Expliziter Port:** vor dem Prozess-Spawn wird geprüft, ob der Port frei ist
+  (SO_REUSEADDR erlaubt TIME_WAIT-Restart, lehnt aktive Listener ab). Ein
+  fremder HTTP-Listener auf dem Port kann daher nicht als „gesunder eigener
+  Start" missdeutet werden; belegter Port → `start` abgelehnt, ohne Spawn.
+- **Erfolgsweg-Validierung:** nach erfolgreichem Healthcheck wird die Identität
+  (Token + Startgeneration + PID + `running`) erneut geprüft. Wurde der Start
+  zwischenzeitlich `gestoppt` oder neu vergeben, meldet `start` **nicht** still
+  `healthy=true`, sondern `healthy=false` mit `warning` — kein State-Restore.
 - **Bounded restart:** Default 2 Versuche, dann Endzustand mit gezählten Fehlern
   („Versuch 1 … Versuch 2 …") melden; State endet sauber (`running=false`).
 - **Idle-Diagnose:** nach 2 h ohne Herzschlag meldet `status` `idle_diagnose: true`
@@ -53,15 +65,17 @@ python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Cre
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 19 Tests, u. a. echte 5-Prozess-Konkurrenz
+python3 -m unittest discover -s tests -v   # 22 Tests, u. a. echte 5-Prozess-Konkurrenz
 ```
 
-Abgedeckte Regressionen (QA Runde 1): echter paralleler Vergabetest mit 5 CLI-Prozessen
+Abgedeckte Regressionen (QA Runde 1 + 2): echter paralleler Vergabetest mit 5 CLI-Prozessen
 (4 belegt, 5. abgewiesen), Lease-Wechsel mit laufendem Prozess (kein Doppelstart,
 `--steal`-Übernahme), `release --keep-process`-Ablehnung, Stale-Timeout-Race
 (Startgeneration), dokumentiertes `-- <Kommando>`-CLI, negative bounded-restart-Tests,
-aktiver Lease verhindert Idle-Diagnose. Kindprozesse werden deterministisch reaped
-(keine ResourceWarnings).
+aktiver Lease verhindert Idle-Diagnose, Auto-Vergabe überspringt verwaiste Slots,
+belegter expliziter Port wird vor Spawn abgelehnt (fremder Listener ≠ eigener Start),
+stop während der Erfolgs-Finalisierung wird als abgebrochener Start gemeldet.
+Kindprozesse werden deterministisch reaped (keine ResourceWarnings).
 
 Integrationstests starten einen realen Dummy-HTTP-Server auf loopback und fragen ihn
 per HTTP ab. Kein npm, kein Supabase, kein Docker.

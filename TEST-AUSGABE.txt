@@ -1,4 +1,4 @@
-== unittest suite (python3 3.9.6), 2026-10-15 16:59:04 CEST ==
+=== unittest-Suite nach QA-Runde-2-Rework 2026-10-15 17:19:01 ===
 test_konkurrierende_vergabe_4_slots_5ter_abgewiesen (test_slots.TestAcquire) ... ok
 test_owner_schutz (test_slots.TestAcquire) ... ok
 test_slot_wunsch_belegt_abgewiesen (test_slots.TestAcquire) ... ok
@@ -15,35 +15,21 @@ test_release_keep_process_waehrend_lauf_abgelehnt (test_slots.TestLeaseProzessZu
 test_healthcheck_timeout_cleanup_nur_eigener_prozess (test_slots.TestProcess) ... ok
 test_restart_bounded (test_slots.TestProcess) ... ok
 test_start_healthcheck_stop (test_slots.TestProcess) ... ok
+test_auto_acquire_ueberspringt_verwaisten_slot (test_slots.TestQARunde2) ... ok
+test_belegter_expliziter_port_wird_abgelehnt_kein_fremd_listener (test_slots.TestQARunde2) ... ok
+test_stop_waehrend_success_finalisierung_meldet_keinen_gesunden_start (test_slots.TestQARunde2) ... ok
 test_restart_max_attempts_1_nur_ein_versuch (test_slots.TestRestartBoundedNegativ) ... ok
 test_restart_scheitert_nach_max_attempts_mit_zaehlung (test_slots.TestRestartBoundedNegativ) ... ok
 test_alter_timeout_ueberschreibt_neuen_start_nicht (test_slots.TestStaleTimeoutRace) ... ok
 
 ----------------------------------------------------------------------
-Ran 19 tests in 147.404s
+Ran 22 tests in 161.401s
 
 OK
-RC=0
+rc=0
 
-== QA-Probe (qa_probe.py) nach Fix, 17:01:34 ==
-CONCURRENT acquire: successes= [1, 2, 3, 4] rejected= 1
-DOCUMENTED custom CLI: rc= 1 stderr= FEHLER: healthcheck timeout nach 30.0s: <urlopen error [Errno 61] Connection refused>
-Traceback (most recent call last):
-  File "/Volumes/External Disk/Users/thomas/.hermes/kanban/workspaces/t_407deb93/qa_probe.py", line 42, in <module>
-    b = mgr.acquire('qa-b', 4)
-  File "/Volumes/External Disk/Users/thomas/.hermes/kanban/workspaces/t_407deb93/testslot_manager/manager.py", line 183, in acquire
-    raise SlotError(
-testslot_manager.manager.SlotError: Slot 4: Lease abgelaufen, aber Prozess pid=2827 (Port 31260) laeuft noch. Alter Owner kann mit seinem Token stoppen; Uebernahme nur mit acquire --steal.
-RC=1
-
-== Interpretation der QA-Probe nach Fix ==
-- "DOCUMENTED custom CLI: rc= 1" (vorher rc=2 argparse-Fehler): das dokumentierte
-  `-- <Kommando>` wird jetzt angenommen; rc=1 hier nur, weil das Probe-Kommando
-  (`python3 -c pass`) nie /health bedient -> regulärer bounded Healthcheck-Timeout.
-- Der Abbruch in Abschnitt "EXPIRED LEASE double-start" ist der beabsichtigte Fix:
-  acquire auf Slot mit abgelaufenem Lease aber lebendem Prozess wird jetzt abgewiesen
-  ("Lease abgelaufen, aber Prozess ... laeuft noch ... acquire --steal"). Genau dieses
-  Szenario ist als Regressionstest test_abgelaufener_lease_mit_laufendem_prozess_kein_doppelstart
-  und test_acquire_steal_beendet_eigenen_verwaisten_prozess eingecheckt.
-- "STALE TIMEOUT"-Abschnitt wird von denselben Regressionstests
-  (TestStaleTimeoutRace.test_alter_timeout_ueberschreibt_neuen_start_nicht) abgedeckt.
+=== QA-R2-Probe nach Fix (muss alle 3 Szenarien korrekt behandeln) ===
+AUTO ACQUIRE with slots 2..4 free: assigned 2
+OCCUPIED EXPLICIT PORT rejected: Port 31200 ist bereits belegt — start abgelehnt (kein fremder Listener als eigener Start akzeptiert)
+STOP DURING SUCCESS FINALIZATION: returned healthy= False actual running= False warning= start nicht als gesunder Erfolg gueltig: Slot-State wurde zwischenzeitlich gestoppt/geaendert (pid/gen/running-Identitaet verletzt; state_pid=None, gen=1, running=False) — kein State-Restore errors= []
+probe rc=0

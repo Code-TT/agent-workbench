@@ -180,6 +180,10 @@ class SlotManager:
                     # Laufender Prozess gehört zur bisherigen Zuordnung —
                     # weder löschen noch unkontrolliert neu vergeben.
                     if not steal:
+                        if slot is None:
+                            # Auto-Vergabe: verwaisten Slot überspringen und
+                            # weiter suchen, statt trotz freier Slots abzubrechen.
+                            continue
                         raise SlotError(
                             f"Slot {n}: Lease abgelaufen, aber Prozess "
                             f"pid={st.pid} (Port {st.port}) laeuft noch. "
@@ -253,6 +257,14 @@ class SlotManager:
                 port = self._free_port(lo, hi)
             elif not (lo <= port <= hi):
                 raise SlotError(f"Port {port} liegt nicht im Bereich {lo}-{hi} von Slot {slot}")
+            else:
+                # Expliziter Port: vor Spawn belegt-Prüfung. Sonst könnte die
+                # Healthcheck-Antwort von einem FREMDEN Listener auf diesem
+                # Port stammen und als eigener gesunder Start missdeutet werden.
+                if not self._port_bindable(port):
+                    raise SlotError(
+                        f"Port {port} ist bereits belegt — start abgelehnt "
+                        "(kein fremder Listener als eigener Start akzeptiert)")
             log_path = self.logs_dir / f"slot-{slot}.log"
             env = dict(os.environ, TESTSLOT_PORT=str(port))
             with open(log_path, "ab") as logf:
@@ -276,19 +288,28 @@ class SlotManager:
         # Healthcheck außerhalb des Locks (blockiert keine Vergabe).
         ok, detail = self._wait_healthy(port, health_timeout)
         if ok:
-            res = {"slot": slot, "pid": my_pid, "port": port,
-                   "healthy": True, "log": st.log_path}
-            # Erfolgsweg: nichts zurückschreiben (könnte einen zwischenzeitlich
-            # neueren Start/stop überschreiben). Nur informieren, falls der
-            # Slot inzwischen nicht mehr uns gehört.
+            # Erfolgsweg: Identität gegen zwischenzeitlichen stop/Neuvergabe
+            # prüfen (stop derselben Generation ändert Token/Gen NICHT —
+            # deshalb zusätzlich pid/starttime/running vergleichen). Ein
+            # geänderter/abgebrochener Start wird als solcher gemeldet,
+            # nicht als gesunder Erfolg.
             with self._atomic():
                 st_now = self._read(slot)
-            if st_now.token != token or st_now.start_gen != my_gen:
-                res["warning"] = ("Slot-State wurde zwischenzeitlich geaendert "
-                                  f"(Generation {st_now.start_gen} != {my_gen}) — "
-                                  "Prozess laeuft, gehoert aber nicht mehr zur "
-                                  "aktuellen Zuordnung")
-            return res
+            same = (st_now.token == token and st_now.start_gen == my_gen
+                    and st_now.pid == my_pid
+                    and st_now.pid_starttime == my_starttime
+                    and st_now.running and _alive(my_pid, my_starttime))
+            if same:
+                return {"slot": slot, "pid": my_pid, "port": port,
+                        "healthy": True, "log": st.log_path}
+            return {"slot": slot, "pid": my_pid, "port": port,
+                    "healthy": False, "log": st.log_path,
+                    "warning": ("start nicht als gesunder Erfolg gueltig: "
+                                "Slot-State wurde zwischenzeitlich gestoppt/"
+                                "geaendert (pid/gen/running-Identitaet "
+                                f"verletzt; state_pid={st_now.pid}, "
+                                f"gen={st_now.start_gen}, running="
+                                f"{st_now.running}) — kein State-Restore")}
         # Timeout: kontrolliertes Cleanup ausschließlich des eigenen Prozesses
         # (unser Spawn, pid+starttime). State nur überschreiben, wenn die
         # Startgeneration unverändert ist — sonst hat ein neuerer Start/stop
@@ -311,13 +332,21 @@ class SlotManager:
 
     def _free_port(self, lo: int, hi: int) -> int:
         for p in range(lo, hi + 1):
-            with socket.socket() as s:
-                try:
-                    s.bind(("127.0.0.1", p))
-                    return p
-                except OSError:
-                    continue
+            if self._port_bindable(p):
+                return p
         raise SlotError(f"kein freier Port in {lo}-{hi}")
+
+    @staticmethod
+    def _port_bindable(port: int) -> bool:
+        """True, wenn sich der Port jetzt binden laesst. SO_REUSEADDR erlaubt
+        TIME_WAIT-Restart, lehnt aber einen AKTIV lauschenden Listener ab."""
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
 
     @staticmethod
     def _wait_port_free(port: int, timeout: float) -> bool:
