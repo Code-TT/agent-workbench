@@ -1,0 +1,9 @@
+# Slot → Projekt-Zuordnung für den Testplatz-Manager.
+# Format: <slot>=<projekt>   (rein informativ, wird im guard-Report geloggt)
+# Slots 1–2 Portal, Slot 3 Crawler, Slot 4 frei.
+# Wer an einem Projekt arbeitet, nimmt einen der zugeordneten Slots.
+
+1=portal
+2=portal
+3=crawler
+4=free

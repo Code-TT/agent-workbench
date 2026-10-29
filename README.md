@@ -43,9 +43,14 @@ python3 -m testslot_manager restart --slot N --token T [--attempts 2]
 python3 -m testslot_manager logs --slot N [--tail 50]
 python3 -m testslot_manager stop --slot N --token T
 python3 -m testslot_manager release --slot N --token T [--keep-process]
+python3 -m testslot_manager guard [--dry-run]   # Housekeeping: abgelaufene Leases + verwaiste Prozesse
 ```
 
-**Tests** (28 Tests, inkl. echter 5-Prozess-Konkurrenz; Laufzeit ~4 min):
+**Server-Betrieb:** `deploy/` enthält eine systemd-Timer-Unit, die `guard` alle
+15 Minuten laufen lässt (Analogon zum Mac-Cron), plus die Slot→Projekt-Policy
+(`slots.conf`). Installationsschritte: [`deploy/README.md`](deploy/README.md).
+
+**Tests** (35 Tests, inkl. echter 5-Prozess-Konkurrenz; Laufzeit ~4 min):
 
 ```bash
 cd testplatz

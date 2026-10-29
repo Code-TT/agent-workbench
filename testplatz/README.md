@@ -19,6 +19,8 @@ python3 -m testslot_manager stop --slot N --token T
 python3 -m testslot_manager release --slot N --token T [--keep-process]
 python3 -m testslot_manager db-refresh   # -> hart "nicht verfügbar" (keine Credentials)
 python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Credentials)
+python3 -m testslot_manager guard [--dry-run] [--policy /etc/testplatz/slots.conf]
+                                         # Housekeeping: abgelaufene Leases + verwaiste Slot-Prozesse
 ```
 
 ## Semantik / Garantien
@@ -87,7 +89,7 @@ python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Cre
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 28 Tests, u. a. echte 5-Prozess-Konkurrenz
+python3 -m unittest discover -s tests -v   # 35 Tests, u. a. echte 5-Prozess-Konkurrenz
 ```
 
 Abgedeckte Regressionen (QA Runde 1 + 2): echter paralleler Vergabetest mit 5 CLI-Prozessen

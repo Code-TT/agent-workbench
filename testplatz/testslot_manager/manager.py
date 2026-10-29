@@ -563,6 +563,87 @@ class SlotManager:
         return out
 
 
+    # ---------- guard (Housekeeping, systemd-Timer) ----------
+
+    def _policy(self, path: str | Path | None = None) -> dict[int, str]:
+        """Slot→Projekt-Zuordnung, rein informativ für Report/Log.
+
+        Format: eine Zeile je Slot, `<n>=<projekt>`; `#` leitet Kommentare ein.
+        Fehlt die Datei, ist die Policy leer (kein Fehler).
+        """
+        p = Path(path or os.environ.get("TESTSLOT_POLICY", "/etc/testplatz/slots.conf"))
+        out: dict[int, str] = {}
+        try:
+            for line in p.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                try:
+                    n = int(k.strip())
+                except ValueError:
+                    continue
+                if 1 <= n <= SLOT_COUNT:
+                    out[n] = v.strip()
+        except OSError:
+            pass
+        return out
+
+    def guard(self, dry_run: bool = False,
+              policy_path: str | Path | None = None) -> dict:
+        """Räumt abgelaufene Leases und verwaiste Slot-Prozesse auf.
+
+        Analogon zum Mac-Cron `dev-slot-guard`. Fail-closed-Regeln:
+        - Nur Slots mit ABGELAUFENEM Lease werden angefasst — aktive Leases nie.
+        - Prozesse werden ausschließlich über `_kill_own` (PID **und** Startzeit)
+          beendet — nie blind.
+        - Läuft ein Prozess, dessen Startzeit nicht nachweisbar ist, bleibt der
+          Slot unangetastet (Identität ungesichert).
+        - Korrupter State wird gemeldet, nicht überschrieben.
+        - `dry_run` meldet nur und ändert nichts.
+        """
+        actions: list[dict] = []
+        with self._atomic():
+            now = time.time()
+            for n in range(1, SLOT_COUNT + 1):
+                try:
+                    st = self._read(n)
+                except SlotError as e:
+                    actions.append({"slot": n, "action": "state_error", "detail": str(e)})
+                    continue
+                if st.owner is None:
+                    # Freier Slot: nur tote Prozessreste des Managers ausräumen.
+                    if st.running and st.pid:
+                        if st.pid_starttime is None:
+                            actions.append({"slot": n, "action": "skipped",
+                                            "detail": "running ohne nachweisbare Startzeit"})
+                        elif _alive(st.pid, st.pid_starttime):
+                            actions.append({"slot": n, "action": "skipped",
+                                            "detail": "freier Slot mit lebendem Prozess"})
+                        else:
+                            if not dry_run:
+                                self._write(SlotState(slot=n, log_path=st.log_path))
+                            actions.append({"slot": n, "action": "dead_process_cleared"})
+                    continue
+                if not (st.lease_expiry and st.lease_expiry < now):
+                    continue  # aktiver Lease — nicht anfassen
+                killed = False
+                if st.running and st.pid:
+                    if st.pid_starttime is None:
+                        actions.append({"slot": n, "action": "skipped",
+                                        "detail": "Lease abgelaufen, laufender Prozess ohne "
+                                                  "nachweisbare Startzeit — nicht angefasst"})
+                        continue
+                    killed = True if dry_run else self._kill_own(st)
+                if not dry_run:
+                    self._write(SlotState(slot=n, log_path=st.log_path))
+                actions.append({"slot": n, "action": "lease_expired_freed",
+                                "owner": st.owner, "process_stopped": killed})
+        return {"checked": SLOT_COUNT, "dry_run": dry_run, "now": now,
+                "policy": {str(k): v for k, v in self._policy(policy_path).items()},
+                "actions": actions}
+
+
 # ---------- bewusst NICHT verfügbare Adapter ----------
 
 class DbRefreshUnavailable(Exception):

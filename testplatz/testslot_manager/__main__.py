@@ -42,6 +42,9 @@ def main(argv=None) -> int:
     st = sub.add_parser("stop"); st.add_argument("--slot", type=int, required=True); st.add_argument("--token", required=True)
     lg = sub.add_parser("logs"); lg.add_argument("--slot", type=int, required=True); lg.add_argument("--tail", type=int, default=50)
     sub.add_parser("db-refresh"); sub.add_parser("db-backup")
+    g = sub.add_parser("guard", help="raevmt abgelaufene Leases und verwaiste Slot-Prozesse auf")
+    g.add_argument("--dry-run", action="store_true", help="nur melden, nichts aendern")
+    g.add_argument("--policy", default=None, help="Slot->Projekt-Zuordnung (Default /etc/testplatz/slots.conf)")
 
     args = p.parse_args(argv)
     mgr = m.SlotManager()
@@ -68,6 +71,8 @@ def main(argv=None) -> int:
             m.db_refresh()
         elif args.cmd == "db-backup":
             m.db_backup()
+        elif args.cmd == "guard":
+            print(json.dumps(mgr.guard(dry_run=args.dry_run, policy_path=args.policy), indent=2))
     except (m.SlotError, m.DbRefreshUnavailable, m.DbBackupUnavailable) as e:
         print(f"FEHLER: {e}", file=sys.stderr)
         return 1

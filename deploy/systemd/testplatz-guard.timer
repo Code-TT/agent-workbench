@@ -1,0 +1,13 @@
+[Unit]
+Description=Testplatz-Slot-Housekeeping alle 15 Minuten
+Documentation=https://github.com/Code-TT/agent-workbench
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+AccuracySec=30s
+Unit=testplatz-guard.service
+
+[Install]
+WantedBy=timers.target
