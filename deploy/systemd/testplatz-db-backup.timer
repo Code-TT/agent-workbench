@@ -1,0 +1,12 @@
+[Unit]
+Description=Tägliche EventsDB-Sicherung (04:30)
+Documentation=https://github.com/Code-TT/agent-workbench
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+AccuracySec=1min
+Unit=testplatz-db-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -32,6 +32,21 @@ cd /srv/agent-workbench/testplatz && python3 -m testslot_manager guard --dry-run
 
 Leerer `actions`-Array = alles ruhig.
 
+## Tägliche DB-Sicherung
+
+Zusätzlich sichert ein zweiter Timer die Live-DB (04:30) via `db-backup`:
+
+```bash
+install -m 644 deploy/systemd/testplatz-db-backup.service /etc/systemd/system/
+install -m 644 deploy/systemd/testplatz-db-backup.timer   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now testplatz-db-backup.timer
+```
+
+Voraussetzung: `SUPABASE_DB_URL_LIVE` in `~/.hermes/.env` (Modus 600) und
+`docker`. Sichern liegt in `/root/backups/002_EventsPage/` (Dump + Manifest mit
+SHA256/Objektzahl, Aufbewahrung 14 Tage, die letzten 3 bleiben immer).
+
 ## Konfiguration
 
 | Ort | Zweck |

@@ -1,0 +1,12 @@
+[Unit]
+Description=EventsDB (Live) Sicherung per pg_dump
+Documentation=https://github.com/Code-TT/agent-workbench
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=TESTSLOT_STATE_DIR=/var/lib/testplatz
+Environment=BACKUP_DIR=/root/backups/002_EventsPage
+WorkingDirectory=/srv/agent-workbench/testplatz
+ExecStart=/usr/bin/python3 -m testslot_manager db-backup
