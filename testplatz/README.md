@@ -17,8 +17,8 @@ python3 -m testslot_manager restart --slot N --token T [--attempts 2]
 python3 -m testslot_manager logs --slot N [--tail 50]
 python3 -m testslot_manager stop --slot N --token T
 python3 -m testslot_manager release --slot N --token T [--keep-process]
-python3 -m testslot_manager db-refresh   # -> hart "nicht verfügbar" (keine Credentials)
-python3 -m testslot_manager db-backup    # -> hart "nicht verfügbar" (keine Credentials)
+python3 -m testslot_manager db-backup    # echte pg_dump-Sicherung + Manifest (braucht SUPABASE_DB_URL_LIVE + docker)
+python3 -m testslot_manager db-refresh   # Pull Live -> Ziel; nur mit TESTSLOT_DEV_DB_URL/DEV_DATABASE_URL
 python3 -m testslot_manager guard [--dry-run] [--policy /etc/testplatz/slots.conf]
                                          # Housekeeping: abgelaufene Leases + verwaiste Slot-Prozesse
 ```

@@ -7,7 +7,7 @@
 5. Healthcheck-Timeout mit kontrolliertem Cleanup (eigenen Prozess toeten)
 6. aktiver Lease verhindert Fremd-acquire; abgelaufener Lease re-acquirierbar
    OHNE Loeschen von Artefakten
-7. DB-Adapter melden hart "nicht verfuegbar" (keine Erfolgssimulation)
+7. DB-Adapter: backup sichert real (braucht Creds+Docker), refresh nur mit Ziel
 
 Der Dummy-Server wird real gestartet und per HTTP abgefragt.
 """
@@ -24,6 +24,7 @@ import time
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -163,11 +164,17 @@ class TestProcess(Base):
 
 
 class TestAdapters(Base):
-    def test_db_adapter_hart_nicht_verfuegbar(self):
-        with self.assertRaises(m.DbRefreshUnavailable):
-            m.db_refresh()
-        with self.assertRaises(m.DbBackupUnavailable):
-            m.db_backup()
+    def test_db_adapter_hart_bei_fehlender_konfiguration(self):
+        # refresh ohne Ziel-DSN -> harter Fehler, kein Vorgang, keine Simulation
+        with mock.patch.dict(os.environ, {"TESTSLOT_DEV_DB_URL": "",
+                                          "DEV_DATABASE_URL": ""}):
+            with self.assertRaises(m.DbRefreshUnavailable):
+                m.db_refresh()
+        # backup ohne Secrets-Datei -> harter Fehler, KEIN echter Live-Dump
+        with mock.patch.dict(os.environ,
+                             {"SUPABASE_ENV_FILE": "/nonexistent/agent-workbench-test.env"}):
+            with self.assertRaises(m.DbBackupUnavailable):
+                m.db_backup()
 
 
 class TestIdleDiagnose(Base):

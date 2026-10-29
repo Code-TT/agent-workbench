@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -644,25 +646,141 @@ class SlotManager:
                 "actions": actions}
 
 
-# ---------- bewusst NICHT verfügbare Adapter ----------
+# ---------- DB-Adapter: Sicherung (real) und Refresh (nur mit Ziel) ----------
 
 class DbRefreshUnavailable(Exception):
-    pass
+    """db_refresh abgelehnt: kein Ziel konfiguriert oder Vorgang fehlgeschlagen."""
 
 
 class DbBackupUnavailable(Exception):
-    pass
+    """db_backup abgelehnt: keine Credentials/docker oder Vorgang fehlgeschlagen."""
 
 
-def db_refresh(*_a, **_kw):
-    """DB-Refresh ist NICHT verfügbar: es liegen keine Credentials vor.
-    Keine Erfolgssimulation — bewusst harter Fehler."""
-    raise DbRefreshUnavailable(
-        "db_refresh nicht verfuegbar: keine DB-Credentials konfiguriert "
-        "(externe Dev-Supabase-Zugaenge ungeklaert). Kein Refresh, keine Simulation.")
+def _secrets_path() -> Path:
+    return Path(os.environ.get("SUPABASE_ENV_FILE", Path.home() / ".hermes" / ".env"))
 
 
-def db_backup(*_a, **_kw):
-    """DB-Backup ist NICHT verfügbar: es liegen keine Credentials vor."""
-    raise DbBackupUnavailable(
-        "db_backup nicht verfuegbar: keine DB-Credentials konfiguriert.")
+def _read_live_url() -> str:
+    """Liest SUPABASE_DB_URL_LIVE aus der geschützten Secrets-Datei.
+
+    Der Wert wird NIE geloggt und nie als Prozessargument übergeben — nur per
+    `-e NAME` an den Docker-Container gereicht.
+    """
+    p = _secrets_path()
+    if not p.exists():
+        raise DbBackupUnavailable(f"Secrets-Datei fehlt: {p} (SUPABASE_ENV_FILE setzen)")
+    for line in p.read_text().splitlines():
+        if line.startswith("SUPABASE_DB_URL_LIVE="):
+            v = line.split("=", 1)[1].strip().strip('"')
+            if v:
+                return v
+    raise DbBackupUnavailable(f"SUPABASE_DB_URL_LIVE fehlt in {p}")
+
+
+def _docker_bin() -> str:
+    d = shutil.which("docker")
+    if not d:
+        raise DbBackupUnavailable("docker nicht im PATH — Sicherung nicht möglich")
+    return d
+
+
+def _redact(text: str, *secrets: str) -> str:
+    for s in secrets:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
+
+def _prune_backups(target: Path, keep_days: int) -> list[str]:
+    dumps = sorted(target.glob("eventsdb_*.dump"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    removed: list[str] = []
+    cutoff = time.time() - keep_days * 86400
+    for d in dumps[3:]:  # die letzten 3 bleiben immer
+        if d.stat().st_mtime < cutoff:
+            d.unlink(missing_ok=True)
+            d.with_suffix(".manifest.txt").unlink(missing_ok=True)
+            removed.append(d.name)
+    return removed
+
+
+def db_backup(target_dir: str | Path | None = None, keep_days: int = 14) -> dict:
+    """Echte Sicherung der Live-DB via pg_dump (im Docker-Container).
+
+    Voraussetzung: `SUPABASE_DB_URL_LIVE` in der Secrets-Datei (`~/.hermes/.env`,
+    Modus 600) und `docker` im PATH. Fehlt eines, bricht es HART ab — keine
+    Erfolgssimulation. Erzeugt Dump + Manifest (SHA256, Objektzahl), Aufbewahrung.
+    """
+    import datetime
+    url = _read_live_url()
+    docker = _docker_bin()
+    target = Path(target_dir or os.environ.get("BACKUP_DIR",
+                                               Path.home() / "backups" / "002_EventsPage"))
+    target.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dump = target / f"eventsdb_{stamp}.dump"
+    image = os.environ.get("PG_IMAGE", "postgres:17")
+    env = dict(os.environ, SUPABASE_DB_URL_LIVE=url,
+               PGSSLMODE=os.environ.get("PGSSLMODE", "require"), OUT_NAME=dump.name)
+    r = subprocess.run(
+        [docker, "run", "--rm", "-e", "PGCONNECT_TIMEOUT=60",
+         "-e", "SUPABASE_DB_URL_LIVE", "-e", "PGSSLMODE", "-e", "OUT_NAME",
+         "-v", f"{target}:/out", image, "sh", "-c",
+         'pg_dump --no-owner --no-privileges --format=custom '
+         '-d "$SUPABASE_DB_URL_LIVE" -f "/out/$OUT_NAME"'],
+        env=env, capture_output=True, text=True)
+    if r.returncode != 0 or not dump.exists() or dump.stat().st_size == 0:
+        detail = _redact((r.stderr or r.stdout or "").strip()[-400:], url)
+        dump.unlink(missing_ok=True)
+        raise DbBackupUnavailable(f"pg_dump fehlgeschlagen: {detail or 'keine Ausgabe'}")
+    os.chmod(dump, 0o600)
+    size = dump.stat().st_size
+    sha = hashlib.sha256(dump.read_bytes()).hexdigest()
+    objects = None
+    rl = subprocess.run(
+        [docker, "run", "--rm", "-v", f"{target}:/out", image, "sh", "-c",
+         f"pg_restore --list /out/{dump.name} | wc -l"], capture_output=True, text=True)
+    if rl.returncode == 0:
+        with contextlib.suppress(ValueError):
+            objects = int(rl.stdout.strip())
+    manifest = target / f"{dump.stem}.manifest.txt"
+    manifest.write_text(
+        "# Sicherung EventsDB (Live)\n"
+        f"Zeitpunkt:   {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"Datei:       {dump.name}\n"
+        f"Größe:       {size} Bytes\n"
+        f"SHA256:      {sha}\n"
+        f"pg_restore-Objekte: {objects}\n")
+    return {"dump": str(dump), "size": size, "sha256": sha, "objects": objects,
+            "manifest": str(manifest),
+            "removed": _prune_backups(target, keep_days)}
+
+
+def db_refresh(dest_url: str | None = None) -> dict:
+    """Pull Live → Ziel-Datenbank. Braucht ein explizit konfiguriertes Ziel.
+
+    Ohne Ziel-DSN (`TESTSLOT_DEV_DB_URL` oder `DEV_DATABASE_URL`) bricht es hart
+    ab: es gibt auf dem Server keinen lokalen Dev-Stack, den man blind füllen darf.
+    """
+    dest = (dest_url or os.environ.get("TESTSLOT_DEV_DB_URL")
+            or os.environ.get("DEV_DATABASE_URL"))
+    if not dest:
+        raise DbRefreshUnavailable(
+            "db_refresh: kein Ziel-DSN konfiguriert (TESTSLOT_DEV_DB_URL oder "
+            "DEV_DATABASE_URL). Kein Vorgang, keine Simulation.")
+    url = _read_live_url()
+    docker = _docker_bin()
+    image = os.environ.get("PG_IMAGE", "postgres:17")
+    env = dict(os.environ, SUPABASE_DB_URL_LIVE=url, DEST_URL=dest,
+               PGSSLMODE=os.environ.get("PGSSLMODE", "require"))
+    r = subprocess.run(
+        [docker, "run", "--rm", "-e", "PGCONNECT_TIMEOUT=60",
+         "-e", "SUPABASE_DB_URL_LIVE", "-e", "DEST_URL", "-e", "PGSSLMODE", image,
+         "sh", "-c",
+         'pg_dump --no-owner --no-privileges --format=custom -d "$SUPABASE_DB_URL_LIVE" '
+         '| pg_restore --no-owner --no-privileges --clean --if-exists -d "$DEST_URL"'],
+        env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        detail = _redact((r.stderr or r.stdout or "").strip()[-400:], url, dest)
+        raise DbRefreshUnavailable(f"db_refresh fehlgeschlagen: {detail or 'keine Ausgabe'}")
+    return {"refreshed": True, "target": "***"}

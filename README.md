@@ -57,11 +57,11 @@ cd testplatz
 python3 -m unittest discover -s tests -v
 ```
 
-**Bekannte Lücken** (ehrlich dokumentiert): `db-refresh` und `db-backup`
-antworten hart „nicht verfügbar" — der Supabase-Teil ist nur ein Stub und
-liefert bewusst keine Erfolgssimulation. Der echte Devserver-Aufruf ist noch
-nicht fest verdrahtet (Default: Dummy-HTTP-Server). Bislang nicht auf einem
-Server ausgerollt.
+**Stand der DB-Adapter:** `db-backup` sichert real (pg_dump im Docker-Container,
+braucht `SUPABASE_DB_URL_LIVE` in `~/.hermes/.env` und `docker`); `db-refresh`
+zieht Live → Ziel, aber nur mit explizit gesetztem Ziel-DSN
+(`TESTSLOT_DEV_DB_URL`/`DEV_DATABASE_URL`) — sonst harter Fehler. Der echte
+Devserver-Aufruf ist noch nicht fest verdrahtet (Default: Dummy-HTTP-Server).
 
 Details: [`testplatz/README.md`](testplatz/README.md)
 
